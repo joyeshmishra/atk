@@ -28,13 +28,16 @@ chmod +x $jq
 
 
 if [ "$KRB5_BASE64" ]; then
-    (base64 -d <<< $KRB5_BASE64) > $DIR/../krb5.conf
+#    (base64 -d <<< $KRB5_BASE64) > $DIR/../krb5.conf
     export KERBEROS_ENABLED=true
-    export KRB5_CONFIG=$DIR/../krb5.conf
-    export YARN_AUTHENTICATED_USERNAME=$(echo $VCAP_SERVICES | $jq -c -r '."user-provided"[] | select (.name == "kerberos-service") | .credentials | .kuser')
-    export YARN_AUTHENTICATED_PASSWORD=$(echo $VCAP_SERVICES | $jq -c -r '."user-provided"[] | select (.name == "kerberos-service") | .credentials | .kpassword')
-    export HADOOP_USER_NAME=$YARN_AUTHENTICATED_USERNAME
+    export KRB5_CONFIG=$DIR/../krb5jwt/etc/krb5.conf
+    export YARN_AUTHENTICATED_USERNAME=cf
+    export YARN_AUTHENTICATED_PASSWORD=cf1
     export KRB5CCNAME=/tmp/cf@CLOUDERA
+#    export YARN_AUTHENTICATED_USERNAME=$(echo $VCAP_SERVICES | $jq -c -r '."user-provided"[] | select (.name == "kerberos-service") | .credentials | .kuser')
+#    export YARN_AUTHENTICATED_PASSWORD=$(echo $VCAP_SERVICES | $jq -c -r '."user-provided"[] | select (.name == "kerberos-service") | .credentials | .kpassword')
+#    export HADOOP_USER_NAME=$YARN_AUTHENTICATED_USERNAME
+#    export KRB5CCNAME=/tmp/cf@CLOUDERA
 else
     export KERBEROS_ENABLED=false
 fi
@@ -164,13 +167,19 @@ if [ -d "$DIR/../lib/daal/intel64_lin" ]; then
  export LD_LIBRARY_PATH=${DAAL_LIB_DIR}:${DAAL_LIB_DIR}/${DAAL_GCC_VERSION}:${LD_LIBRARY_PATH}
 fi
 
-if [ -f ${KRB5_CONFIG} ]; then
- export JAVA_KRB_CONF="-Djava.security.krb5.conf=${KRB5_CONFIG}"
- export USE_SUBJECT_CREDS="-Djavax.security.auth.useSubjectCredsOnly=false"
-fi
+#if [ -f ${KRB5_CONFIG} ]; then
+# export JAVA_KRB_CONF="-Djava.security.krb5.conf=${KRB5_CONFIG}"
+# export USE_SUBJECT_CREDS="-Djavax.security.auth.useSubjectCredsOnly=false"
+#fi
 
-echo java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $JAVA_KRB_CONF $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
-java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $JAVA_KRB_CONF $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
+export USE_SUBJECT_CREDS="-Djavax.security.auth.useSubjectCredsOnly=false"
+
+#echo java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $JAVA_KRB_CONF $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
+#java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $JAVA_KRB_CONF $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
+
+echo java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
+java $@ $JAVA_OPTS -XX:MaxPermSize=384m $SEARCH_PATH $USE_SUBJECT_CREDS -cp "$CP" -Djava.library.path=$LD_LIBRARY_PATH org.trustedanalytics.atk.moduleloader.Module rest-server org.trustedanalytics.atk.rest.RestServerApplication
+
 
 popd
 

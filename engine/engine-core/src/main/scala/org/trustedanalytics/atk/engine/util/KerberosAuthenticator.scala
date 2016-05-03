@@ -25,18 +25,19 @@ import org.trustedanalytics.atk.engine.EngineConfig
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.security.UserGroupInformation
 import org.trustedanalytics.atk.moduleloader.ClassLoaderAware
-import org.trustedanalytics.hadoop.config.{ ConfigurationHelperImpl, PropertyLocator }
+
 import org.trustedanalytics.hadoop.config.client.{ ServiceType, Configurations, ServiceInstanceConfiguration }
 import org.trustedanalytics.hadoop.kerberos.KrbLoginManagerFactory
 import scala.reflect.io.Directory
 import scala.util.control.NonFatal
+import org.trustedanalytics.hadoop.config.client.oauth.{ JwtToken, TapOauthToken }
+import org.trustedanalytics.hadoop.config.client.Property
 
 /**
  * Static methods for accessing a Kerberos secured hadoop cluster.
  */
 object KerberosAuthenticator extends EventLogging with EventLoggingImplicits with ClassLoaderAware {
 
-  val confHelper = ConfigurationHelperImpl.getInstance()
   val DEFAULT_VALUE = ""
   val AUTHENTICATION_METHOD = "kerberos"
   val AUTHENTICATION_METHOD_PROPERTY = "hadoop.security.authentication"
@@ -53,13 +54,13 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
 
   def getKerberosConfigJVMParam: Option[String] = sys.env.get("JAVA_KRB_CONF")
 
-  def getPropertyValue(property: PropertyLocator): String = {
-    val value = confHelper.getPropertyFromEnv(property)
-    value.isPresent match {
-      case true => value.get()
-      case false => DEFAULT_VALUE
-    }
-  }
+  //  def getPropertyValue(property: Property): String = {
+  //    val value = confHelper.getPropertyFromEnv(property)
+  //    value.isPresent match {
+  //      case true => value.get()
+  //      case false => DEFAULT_VALUE
+  //    }
+  //  }
 
   def isKerberosEnabled(hdfsConf: ServiceInstanceConfiguration): Boolean =
     isKerberosEnabled(hdfsConf.asHadoopConfiguration())
@@ -71,16 +72,17 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
     try {
       val helper = Configurations.newInstanceFromEnv()
       val hdfsConf = helper.getServiceConfig(ServiceType.HDFS_TYPE)
+      val returnConfig = hdfsConf.asHadoopConfiguration()
       if (KerberosAuthenticator.isKerberosEnabled(hdfsConf)) {
         val kerberosProperties = new KerberosProperties
         val loginManager = KrbLoginManagerFactory.getInstance()
           .getKrbLoginManagerInstance(kerberosProperties.kdc, kerberosProperties.realm)
         val res = hdfsConf.asHadoopConfiguration()
-        val subject = loginManager.loginWithCredentials(kerberosProperties.user, kerberosProperties.password.toCharArray())
+        val subject = loginManager.loginWithCredentials("cf", "cf1".toCharArray())
         loginManager.loginInHadoop(subject, res)
         UserAuthenticatedConfiguration(subject, res)
       }
-      else UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
+      else UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), returnConfig)
     }
     catch {
       case t: Throwable =>
@@ -88,12 +90,16 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
           "using System credentials for authentication. Returning default configuration")
         UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
     }
+    UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
   }
 
   def loginAsAuthenticatedUser(): Unit = {
     try {
-      val yarn_authenticated_user = System.getProperty("YARN_AUTHENTICATED_USERNAME")
-      val yarn_authenticated_password = System.getProperty("YARN_AUTHENTICATED_PASSWORD")
+      //      val yarn_authenticated_user = System.getProperty("YARN_AUTHENTICATED_USERNAME")
+      //      val yarn_authenticated_password = System.getProperty("YARN_AUTHENTICATED_PASSWORD")
+      val yarn_authenticated_user = "cf"
+      val yarn_authenticated_password = "cf1"
+
       import sys.process._
       // Run kinit on a node and key in the password. The user and password are supplied by the environment
       s"echo $yarn_authenticated_password" #| s"kinit $yarn_authenticated_user" !
@@ -103,11 +109,53 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
     }
   }
 
+  //  def loginWithKtInit(username: String, keytab: String): Unit = {
+  //    try {
+  //      import sys.process._
+  //      // Run kinit on a node and key in the password. The user and password are supplied by the environment
+  //      s"krb5jwt/bin/ktinit $username -t $keytab" !
+  //    }
+  //    catch {
+  //      case t: Throwable => info("Failed to run ktinit")
+  //        t.printStackTrace()
+  //    }
+  //  }
+
+  def submitYarnJobAsAuthenticatedUser(jwtToken: JwtToken): UserAuthenticatedConfiguration = {
+    try {
+      val helper = Configurations.newInstanceFromEnv()
+      val hdfsConf = helper.getServiceConfig(ServiceType.HDFS_TYPE)
+      if (KerberosAuthenticator.isKerberosEnabled(hdfsConf)) {
+        val kerberosProperties = new KerberosProperties
+        val loginManager = KrbLoginManagerFactory.getInstance()
+          .getKrbLoginManagerInstance(kerberosProperties.kdc, kerberosProperties.realm)
+        val res = hdfsConf.asHadoopConfiguration()
+        val subject = loginManager.loginWithJWTtoken(jwtToken)
+        loginManager.loginInHadoop(subject, res)
+        UserAuthenticatedConfiguration(subject, res)
+      }
+      else UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
+    }
+    catch {
+      case t: Throwable =>
+        info("Printing stack trace as to why kinit failed")
+        t.printStackTrace()
+        info(s"Failed to loginUsingHadooputils. Either kerberos is not enabled or invalid setup or " +
+          "using System credentials for authentication. Returning default configuration")
+        UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
+    }
+  }
+
 }
 
 case class UserAuthenticatedConfiguration(subject: Subject, configuration: Configuration)
 
-case class KerberosProperties(kdc: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.KRB_KDC),
-                              realm: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.KRB_REALM),
-                              user: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.USER),
-                              password: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.PASSWORD))
+// This has changed and needs to be refactored based on 0.6.2 hadoop-utils
+//case class KerberosProperties(kdc: String = KerberosAuthenticator.getPropertyValue(Property.KRB_KDC),
+//                              realm: String = KerberosAuthenticator.getPropertyValue(Property.KRB_REALM),
+//                              user: String = KerberosAuthenticator.getPropertyValue(Property.USER),
+//                              password: String = KerberosAuthenticator.getPropertyValue(Property.PASSWORD))
+case class KerberosProperties(kdc: String = "cdh-manager-0.node.trustedanalytics.consul",
+                              realm: String = "CLOUDERA",
+                              user: String = "cf",
+                              password: String = "cf1")
