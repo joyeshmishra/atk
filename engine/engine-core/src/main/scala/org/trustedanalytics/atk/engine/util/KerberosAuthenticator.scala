@@ -17,31 +17,54 @@
 package org.trustedanalytics.atk.engine.util
 
 import java.security.AccessController
+import java.util
 import javax.security.auth.Subject
 
+import org.apache.http.auth.{ AuthScope, UsernamePasswordCredentials }
+
+import org.apache.commons.httpclient.{ HttpsURL, HttpURL }
+import org.apache.http.HttpHost
+import org.apache.http.client.config.RequestConfig
+import org.apache.http.client.entity.UrlEncodedFormEntity
+import org.apache.http.client.methods.{ HttpPost, CloseableHttpResponse, HttpGet }
+import org.apache.http.impl.client.{ BasicCredentialsProvider, HttpClientBuilder, HttpClients }
+import org.apache.http.message.BasicNameValuePair
 import org.trustedanalytics.atk.event.EventLogging
 import org.trustedanalytics.atk.EventLoggingImplicits
 import org.trustedanalytics.atk.engine.EngineConfig
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.security.UserGroupInformation
 import org.trustedanalytics.atk.moduleloader.ClassLoaderAware
-import org.trustedanalytics.hadoop.config.{ ConfigurationHelperImpl, PropertyLocator }
+import org.trustedanalytics.hadoop.config.client.oauth.{ TapOauthToken, JwtToken }
 import org.trustedanalytics.hadoop.config.client.{ ServiceType, Configurations, ServiceInstanceConfiguration }
 import org.trustedanalytics.hadoop.kerberos.KrbLoginManagerFactory
-import scala.reflect.io.Directory
-import scala.util.control.NonFatal
+import org.trustedanalytics.hadoop.config.client.Property
+import spray.json._
+import DefaultJsonProtocol._
+
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * Static methods for accessing a Kerberos secured hadoop cluster.
  */
 object KerberosAuthenticator extends EventLogging with EventLoggingImplicits with ClassLoaderAware {
 
-  val confHelper = ConfigurationHelperImpl.getInstance()
   val DEFAULT_VALUE = ""
   val AUTHENTICATION_METHOD = "kerberos"
   val AUTHENTICATION_METHOD_PROPERTY = "hadoop.security.authentication"
 
-  // TODO: Allow support for multiple keytabs once namespaces is implemented
+  // This method will throw an exception if kerberos-service bindings are not available as part of env. variables
+  def getPropertyValue(property: Property): String = {
+    try {
+      val helper = Configurations.newInstanceFromEnv()
+      helper.getServiceConfig(ServiceType.KERBEROS_TYPE).getProperty(property).get()
+    }
+    catch {
+      case _: Throwable =>
+        info(s"Kerberos Service Bindings are not available. Return Default Value: $DEFAULT_VALUE")
+        DEFAULT_VALUE
+    }
+  }
 
   /**
    * Login to Kerberos cluster with classloader
@@ -53,14 +76,6 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
 
   def getKerberosConfigJVMParam: Option[String] = sys.env.get("JAVA_KRB_CONF")
 
-  def getPropertyValue(property: PropertyLocator): String = {
-    val value = confHelper.getPropertyFromEnv(property)
-    value.isPresent match {
-      case true => value.get()
-      case false => DEFAULT_VALUE
-    }
-  }
-
   def isKerberosEnabled(hdfsConf: ServiceInstanceConfiguration): Boolean =
     isKerberosEnabled(hdfsConf.asHadoopConfiguration())
 
@@ -71,12 +86,61 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
     try {
       val helper = Configurations.newInstanceFromEnv()
       val hdfsConf = helper.getServiceConfig(ServiceType.HDFS_TYPE)
+      val res = hdfsConf.asHadoopConfiguration()
+      if (KerberosAuthenticator.isKerberosEnabled(hdfsConf)) {
+        val kerberosProperties = new KerberosProperties
+        val loginManager = KrbLoginManagerFactory.getInstance()
+          .getKrbLoginManagerInstance(kerberosProperties.kdc, kerberosProperties.realm)
+        // TODO Remove Hardcoding Joyesh
+        val subject = loginManager.loginWithJWTtoken(new TapOauthToken(getJwtToken()))
+        loginManager.loginInHadoop(subject, res)
+        UserAuthenticatedConfiguration(subject, res)
+      }
+      else UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), res)
+    }
+    catch {
+      case t: Throwable =>
+        t.printStackTrace()
+        info(s"Failed to loginUsingHadooputils. Either kerberos is not enabled or invalid setup or " +
+          "using System credentials for authentication. Returning default configuration")
+        UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
+    }
+  }
+
+  def submitYarnJobAsCfUser(): UserAuthenticatedConfiguration = {
+    try {
+      val helper = Configurations.newInstanceFromEnv()
+      val hdfsConf = helper.getServiceConfig(ServiceType.YARN_TYPE)
+      val res = hdfsConf.asHadoopConfiguration()
+      if (KerberosAuthenticator.isKerberosEnabled(hdfsConf)) {
+        val kerberosProperties = new KerberosProperties
+        val loginManager = KrbLoginManagerFactory.getInstance()
+          .getKrbLoginManagerInstance(kerberosProperties.kdc, kerberosProperties.realm)
+        val subject = loginManager.loginWithCredentials("cf", "cf1".toCharArray)
+        loginManager.loginInHadoop(subject, res)
+        UserAuthenticatedConfiguration(subject, res)
+      }
+      else UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), res)
+    }
+    catch {
+      case t: Throwable =>
+        t.printStackTrace()
+        info(s"Failed to loginUsingHadooputils. Either kerberos is not enabled or invalid setup or " +
+          "using System credentials for authentication. Returning default configuration")
+        UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
+    }
+  }
+
+  def submitYarnJobAsAuthenticatedUser(jwtToken: JwtToken): UserAuthenticatedConfiguration = {
+    try {
+      val helper = Configurations.newInstanceFromEnv()
+      val hdfsConf = helper.getServiceConfig(ServiceType.YARN_TYPE)
       if (KerberosAuthenticator.isKerberosEnabled(hdfsConf)) {
         val kerberosProperties = new KerberosProperties
         val loginManager = KrbLoginManagerFactory.getInstance()
           .getKrbLoginManagerInstance(kerberosProperties.kdc, kerberosProperties.realm)
         val res = hdfsConf.asHadoopConfiguration()
-        val subject = loginManager.loginWithCredentials(kerberosProperties.user, kerberosProperties.password.toCharArray())
+        val subject = loginManager.loginWithJWTtoken(jwtToken)
         loginManager.loginInHadoop(subject, res)
         UserAuthenticatedConfiguration(subject, res)
       }
@@ -84,30 +148,79 @@ object KerberosAuthenticator extends EventLogging with EventLoggingImplicits wit
     }
     catch {
       case t: Throwable =>
+        info("Printing stack trace as to why kinit failed")
+        t.printStackTrace()
         info(s"Failed to loginUsingHadooputils. Either kerberos is not enabled or invalid setup or " +
           "using System credentials for authentication. Returning default configuration")
         UserAuthenticatedConfiguration(Subject.getSubject(AccessController.getContext()), new Configuration())
     }
   }
 
-  def loginAsAuthenticatedUser(): Unit = {
+  def getJwtToken(): String = withContext("httpsGetQuery") {
+
+    // TODO Remove Hardcodings Joyesh
+    val query = "http://uaa.jan-3-krb-final.gotapaas.eu/oauth/token"
+    val headers = List(("Accept", "application/json"))
+    val data = List(("username", "8361ed28-e028-4778-80e3-7dcc0cf3f8ec"), ("password", "MGavwTZhcPhOBtNH"), ("grant_type", "password"))
+    val credentialsProvider = new BasicCredentialsProvider()
+    credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials("atk-client", "c1oudc0w"))
+
+    // TODO: This method uses Apache HttpComponents HttpClient as spray-http library does not support proxy over https
+    val (proxyHostConfigString, proxyPortConfigString) = ("https.proxyHost", "https.proxyPort")
+    val httpClient = HttpClientBuilder.create().setDefaultCredentialsProvider(credentialsProvider).build()
     try {
-      val yarn_authenticated_user = System.getProperty("YARN_AUTHENTICATED_USERNAME")
-      val yarn_authenticated_password = System.getProperty("YARN_AUTHENTICATED_PASSWORD")
-      import sys.process._
-      // Run kinit on a node and key in the password. The user and password are supplied by the environment
-      s"echo $yarn_authenticated_password" #| s"kinit $yarn_authenticated_user" !
+      val proxy = (sys.props.contains(proxyHostConfigString), sys.props.contains(proxyPortConfigString)) match {
+        case (true, true) => Some(new HttpHost(sys.props.get(proxyHostConfigString).get, sys.props.get(proxyPortConfigString).get.toInt))
+        case _ => None
+      }
+
+      val config = {
+        val cfg = RequestConfig.custom().setConnectTimeout(30)
+        if (proxy.isDefined)
+          cfg.setProxy(proxy.get).build()
+        else cfg.build()
+      }
+
+      val request = new HttpPost(query)
+      val nvps = new util.ArrayList[BasicNameValuePair]
+      data.foreach { case (k, v) => nvps.add(new BasicNameValuePair(k, v)) }
+      request.setEntity(new UrlEncodedFormEntity(nvps))
+
+      for ((headerTag, headerData) <- headers)
+        request.addHeader(headerTag, headerData)
+      request.setConfig(config)
+
+      var response: Option[CloseableHttpResponse] = None
+      try {
+        response = Some(httpClient.execute(request))
+        val inputStream = response.get.getEntity().getContent
+        val result = scala.io.Source.fromInputStream(inputStream).getLines().mkString("\n")
+        println(s"********** $result")
+        result.parseJson.asJsObject().getFields("access_token") match {
+          case values => values(0).asInstanceOf[JsString].value
+        }
+      }
+      catch {
+        case ex: Throwable =>
+          error(s"Error executing request ${ex.getMessage}")
+          // We need this exception to be thrown as this is a generic http request method and let caller handle.
+          throw ex
+      }
+      finally {
+        if (response.isDefined)
+          response.get.close()
+      }
     }
-    catch {
-      case t: Throwable => info("Failed to login as Authenticated User. Kerberos not set or invalid credentials")
+    finally {
+      httpClient.close()
     }
-  }
+  }(null)
 
 }
 
 case class UserAuthenticatedConfiguration(subject: Subject, configuration: Configuration)
 
-case class KerberosProperties(kdc: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.KRB_KDC),
-                              realm: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.KRB_REALM),
-                              user: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.USER),
-                              password: String = KerberosAuthenticator.getPropertyValue(PropertyLocator.PASSWORD))
+case class KerberosProperties(kdc: String = KerberosAuthenticator.getPropertyValue(Property.KRB_KDC),
+                              realm: String = KerberosAuthenticator.getPropertyValue(Property.KRB_REALM),
+                              user: String = KerberosAuthenticator.getPropertyValue(Property.USER),
+                              password: String = KerberosAuthenticator.getPropertyValue(Property.PASSWORD))
